@@ -94,6 +94,14 @@ def _render_page_png(page, matrix):
     return pix.tobytes("png")
 
 
+def _set_current_compat_mode(doc):
+    """Open in Word 2013+ mode, not the template's compatibility mode."""
+    compat = doc.settings.element.find(qn("w:compat"))
+    for cs in compat.findall(qn("w:compatSetting")):
+        if cs.get(qn("w:name")) == "compatibilityMode":
+            cs.set(qn("w:val"), "15")
+
+
 def _heading_with_rule(paragraph, text):
     """Bold heading with a thin rule underneath (e.g. the Comments header)."""
     run = paragraph.add_run(text)
@@ -148,6 +156,7 @@ def convert(pdf_path, docx_path, dpi=DPI):
         _log(f"  pdf: {n_pages} pages, rendering at {dpi} DPI")
 
         doc = Document()
+        _set_current_compat_mode(doc)
         section = doc.sections[0]
         section.page_width, section.page_height = Cm(PAGE_W), Cm(PAGE_H)
         section.top_margin = section.bottom_margin = Cm(MARGIN)
