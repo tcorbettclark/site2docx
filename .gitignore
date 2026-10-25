@@ -20,3 +20,4 @@ build/
 
 # Tool outputs: generated review documents
 *.docx
+*.pdf
