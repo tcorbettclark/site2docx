@@ -1,0 +1,20 @@
+[project]
+name = "site2docx"
+version = "0.1.0"
+description = "Convert a PDF into a Word document: one bordered page image per Word page, with a Comments column beside each image"
+requires-python = ">=3.10"
+dependencies = [
+    "playwright>=1.40",
+    "pymupdf>=1.24",
+    "python-docx>=1.1",
+]
+
+[project.scripts]
+site2docx = "site2docx.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/site2docx"]

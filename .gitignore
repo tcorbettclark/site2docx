@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# uv / virtual environments
+.venv/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# macOS
+.DS_Store
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# Tool outputs: generated review documents
+*.docx
