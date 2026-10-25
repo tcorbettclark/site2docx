@@ -2,8 +2,8 @@
 image in the left column and the page's extracted text in the right column.
 
 Numbered badges are baked into the image at each item's true position — one
-badge per text block, and one per *cell* of every table (empty cells
-included) — and each corresponding paragraph in the right column carries
+badge per text block or list entry, and one per non-empty cell of a table —
+and each corresponding paragraph in the right column carries
 the same number. Reviewers use normal Word comments and track changes on the
 right-column text.
 
@@ -12,6 +12,7 @@ because badge numbers are PDF text and would otherwise pollute the
 extraction.
 """
 
+import re
 import sys
 from io import BytesIO
 from pathlib import Path
@@ -55,7 +56,52 @@ TABLE_BADGE_FONT_PT = 8.0
 # band are dropped. Tolerance added for slightly dipping headers.
 CRUFT_TOP_PT = 30.0
 CRUFT_BOTTOM_PT = 42.0
-EMPTY_CELL_TEXT = "(empty)"  # right-column text for an empty table cell
+
+# --- List items --------------------------------------------------------------
+# A new numbered item starts at any line beginning with a bullet or an
+# enumeration marker, so each bullet / numbered entry gets its own badge.
+# Monospaced text is exempt: '-' and '1.' at line start are usually code.
+_BULLETS = "\u2022\u25e6\u25aa\u2023\u25cf\u25cb\u00b7*-"
+_LIST_MARKER_RE = re.compile(
+    rf"^(?:[{_BULLETS}]|\d{{1,3}}[.)]|[a-z][.)]|[ivx]+[.)]|[A-Z][.)])\s+"
+)
+_MONO_FONT_HINTS = ("mono", "courier", "consol", "menlo")
+# Graphic bullets: some sites (Ada CS included) draw list markers as small
+# vector shapes instead of text glyphs, so they never appear in the text
+# layer. A line counts as a list item start if such a shape sits just to
+# its left, vertically aligned with it.
+_MARKER_MAX_DIM_PT = 9.0
+_MARKER_MAX_LEFT_PT = 36.0
+
+
+def _is_monospace(font_name):
+    return any(hint in font_name.lower() for hint in _MONO_FONT_HINTS)
+
+
+def _marker_drawings(page):
+    """Small filled shapes that look like graphic list bullets."""
+    markers = []
+    for d in page.get_drawings():
+        r = d["rect"]
+        w, h = r.width, r.height
+        if d["type"] not in ("f", "fs"):
+            continue
+        if not (1.5 <= w <= _MARKER_MAX_DIM_PT and 1.5 <= h <= _MARKER_MAX_DIM_PT):
+            continue
+        if not 0.4 <= w / max(h, 1e-6) <= 2.5:  # roughly square/circular
+            continue
+        markers.append(fitz.Rect(r))
+    return markers
+
+
+def _has_graphic_marker(bbox, markers):
+    """True if a graphic bullet sits just left of this line, aligned with it."""
+    for m in markers:
+        if bbox.x0 - _MARKER_MAX_LEFT_PT < m.x1 <= bbox.x0:
+            m_y_mid = (m.y0 + m.y1) / 2
+            if bbox.y0 - 2 <= m_y_mid <= bbox.y1 + 2:
+                return True
+    return False
 
 
 def _log(msg):
@@ -130,9 +176,9 @@ def _page_items(page):
     """Extract the page's text as (text, rect, kind) triples, reading order.
 
     kind is "block" for ordinary paragraphs and "cell" for table cells:
-    every cell of every detected table is numbered individually, empty ones
-    included. Text blocks inside a detected table are folded into their cell
-    rather than numbered twice. Chrome header/footer bands are stripped.
+    every non-empty cell of every detected table is numbered individually.
+    Text blocks inside a detected table are folded into their cell rather
+    than numbered twice. Chrome header/footer bands are stripped.
     """
     page_h = page.rect.height
     try:
@@ -140,6 +186,7 @@ def _page_items(page):
     except Exception:
         tables = []
     regions = [fitz.Rect(t.bbox) for t in tables]
+    markers = _marker_drawings(page)
 
     items = []
     for block in page.get_text("dict", sort=True)["blocks"]:
@@ -154,18 +201,38 @@ def _page_items(page):
         for line in block["lines"]:
             text = "".join(span["text"] for span in line["spans"]).strip()
             if text:
-                lines.append(text)
+                mono = any(_is_monospace(span["font"]) for span in line["spans"])
+                lines.append((text, fitz.Rect(line["bbox"]), mono))
         if not lines:
             continue
-        # Reflow: join lines, mending words hyphenated across a line break.
-        out = lines[0]
-        for text in lines[1:]:
-            if out.endswith("-"):
-                out = out[:-1] + text
-            else:
-                out += " " + text
-        out = out.strip()
-        if out:
+        # One item per list entry: a new item starts at any line beginning
+        # with a bullet or enumeration marker (but not in monospaced code).
+        # Bullets can be text glyphs or small vector shapes (see
+        # _marker_drawings), so both are checked.
+        segs = []
+        for text, bbox, mono in lines:
+            is_item_start = (not mono) and (
+                _LIST_MARKER_RE.match(text) or _has_graphic_marker(bbox, markers)
+            )
+            if segs and is_item_start:
+                segs.append([])
+            if not segs:
+                segs.append([])
+            segs[-1].append((text, bbox))
+        for seg in segs:
+            # Reflow: join lines, mending words hyphenated across a break.
+            out = seg[0][0]
+            for text, _bbox in seg[1:]:
+                if out.endswith("-"):
+                    out = out[:-1] + text
+                else:
+                    out += " " + text
+            out = out.strip()
+            if not out:
+                continue
+            rect = fitz.Rect(seg[0][1])
+            for _text, bbox in seg[1:]:
+                rect |= bbox  # union: wrapped lines belong to the same item
             items.append((out, rect, "block"))
 
     # Every cell of every detected table, row-major; dedupe merged cells.
@@ -184,7 +251,8 @@ def _page_items(page):
                     continue
                 seen.add(key)
                 text = " ".join(page.get_text("text", clip=rect).split())
-                items.append((text or EMPTY_CELL_TEXT, rect, "cell"))
+                if text:
+                    items.append((text, rect, "cell"))
 
     items.sort(key=lambda it: (it[1].y0, it[1].x0))
     return items
@@ -197,13 +265,14 @@ def _draw_badge(page, n, rect, kind):
     with a semi-transparent overlay on the block's top-left corner when
     there is no room to the left.
 
-    Cell: smaller, centred on the cell's top-left grid intersection — it
-    covers border lines (decoration) rather than content, and consecutive
-    rows' badges don't collide for rows taller than the badge diameter.
+    Cell: smaller, pulled down and left from the cell's top-right grid
+    intersection by about a third of the badge size, so the badge sits
+    clearly inside its own cell (over border and padding, not content).
     """
     if kind == "cell":
         r, font_pt = TABLE_BADGE_R_PT, TABLE_BADGE_FONT_PT
-        cx, cy = rect.x0, rect.y0
+        inset = 2 * r / 3.0
+        cx, cy = rect.x1 - inset, rect.y0 + inset
         overlay = False
     else:
         r, font_pt = BADGE_R_PT, BADGE_FONT_PT

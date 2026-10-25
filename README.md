@@ -6,7 +6,8 @@ Every page becomes an image capture on its own landscape Word page (colour,
 150 DPI, 1pt black border baked into the pixels) in the left column, with
 the page's extracted source text beside it in the right column. Numbered
 badges baked into the image mark each item at its true position — one badge
-per text block, and one per cell of every table, empty cells included —
+per text block or list entry (bulleted and numbered lists get one badge per
+item), and one per non-empty cell of a table —
 and the same numbers prefix the corresponding right-column paragraphs.
 Reviewers use normal Word comments and track changes on the extracted
 text. The document opens in Print Layout view.
@@ -40,20 +41,21 @@ Each Word page (A4 landscape) is a two-column section:
 
 - **Left (13.6 cm)**: the rendered page image. Numbered badges (white circle,
   black outline) are baked in at each item's true position — just left of
-  each block's first character, or centred on each table cell's top-left
-  grid intersection (smaller, so they cover border lines rather than
-  content). Blocks hard against the page edge get a semi-transparent badge
-  on their top-left corner instead.
+  each block's first character, or just inside the top-right corner of each
+  table cell (offset down and left from the corner so the badge clearly
+  belongs to its own cell). Blocks hard against the page edge get a
+  semi-transparent badge on their top-left corner instead.
 - **Right (13.6 cm, 0.5 cm gutter)**: the page's text, reflowed into
   paragraphs at 10pt, each prefixed with its bold badge number. Every
-  table cell is a numbered item of its own (empty cells show as
-  "(empty)", so reviewers can comment on them too).
+  non-empty table cell is a numbered item of its own.
 
 The whole document is a single two-column section; source pages are separated
 by page breaks, so overflowing text flows onto an extra page rather than
 being clipped. Chrome's print header/footer bands are filtered out of the
 extraction. Badge numbers are drawn *after* text extraction, so they never
-leak into the right column.
+leak into the right column. Bullets may be text
+glyphs *or* small vector shapes (the Ada CS site draws them as vector
+squares); both are treated as list-item markers.
 
 ## Modules
 
