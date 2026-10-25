@@ -2,10 +2,14 @@
 
 One command: a URL or a PDF goes in, a reviewable Word document comes out.
 
-Every page becomes an image capture on its own Word page (colour, 150 DPI,
-1pt black border baked into the pixels), so reviewers can't — and won't try
-to — edit the text. A "Comments" column sits beside each page image for the
-reviewer to type into.
+Every page becomes an image capture on its own landscape Word page (colour,
+150 DPI, 1pt black border baked into the pixels) in the left column, with
+the page's extracted source text beside it in the right column. Numbered
+badges baked into the image mark each item at its true position — one badge
+per text block, and one per cell of every table, empty cells included —
+and the same numbers prefix the corresponding right-column paragraphs.
+Reviewers use normal Word comments and track changes on the extracted
+text. The document opens in Print Layout view.
 
 ## Usage
 
@@ -32,11 +36,24 @@ uv run site2docx "https://adacomputerscience.org/concepts/coursedata_unit8?topic
 
 ## Layout
 
-Each Word page (A4) is a two-column table:
+Each Word page (A4 landscape) is a two-column section:
 
-- **Left (13.6 cm)**: the rendered page image, centred, 1pt black border.
-- **Right (5.4 cm)**: a bold "Comments" heading with a rule under it, plus
-  blank space.
+- **Left (13.6 cm)**: the rendered page image. Numbered badges (white circle,
+  black outline) are baked in at each item's true position — just left of
+  each block's first character, or centred on each table cell's top-left
+  grid intersection (smaller, so they cover border lines rather than
+  content). Blocks hard against the page edge get a semi-transparent badge
+  on their top-left corner instead.
+- **Right (13.6 cm, 0.5 cm gutter)**: the page's text, reflowed into
+  paragraphs at 10pt, each prefixed with its bold badge number. Every
+  table cell is a numbered item of its own (empty cells show as
+  "(empty)", so reviewers can comment on them too).
+
+The whole document is a single two-column section; source pages are separated
+by page breaks, so overflowing text flows onto an extra page rather than
+being clipped. Chrome's print header/footer bands are filtered out of the
+extraction. Badge numbers are drawn *after* text extraction, so they never
+leak into the right column.
 
 ## Modules
 
@@ -44,7 +61,8 @@ Each Word page (A4) is a two-column table:
 - `webpdf.py` — Playwright rendering: load, wait for the React app to settle,
   dismiss cookie banners, scroll to trigger lazy loads, expand collapsed
   sections, print to PDF
-- `docxbuild.py` — PDF to Word: one bordered image + Comments column per page
+- `docxbuild.py` — PDF to Word: landscape two-column pages (image left,
+  numbered, reflowed text right), badges baked into the page images
 
 Tunables (DPI, border weight, column widths, print margins) are constants at
 the top of `docxbuild.py` and `webpdf.py`.

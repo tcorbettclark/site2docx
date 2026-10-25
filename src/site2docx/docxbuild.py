@@ -1,6 +1,16 @@
-"""PDF -> Word: every PDF page becomes a bordered image on its own Word page,
-with a Comments column beside it. Moved here from cli.py for separation of
-concerns; see cli.py for the end-to-end URL -> Word flow."""
+"""PDF -> Word: every PDF page becomes one landscape Word page with the page
+image in the left column and the page's extracted text in the right column.
+
+Numbered badges are baked into the image at each item's true position — one
+badge per text block, and one per *cell* of every table (empty cells
+included) — and each corresponding paragraph in the right column carries
+the same number. Reviewers use normal Word comments and track changes on the
+right-column text.
+
+Ordering matters: text is extracted from the PDF *before* badges are drawn,
+because badge numbers are PDF text and would otherwise pollute the
+extraction.
+"""
 
 import sys
 from io import BytesIO
@@ -8,72 +18,213 @@ from pathlib import Path
 
 import pymupdf as fitz  # PyMuPDF
 from docx import Document
-from docx.enum.table import WD_ALIGN_VERTICAL
-from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
+from docx.enum.section import WD_ORIENT
+from docx.enum.text import WD_BREAK
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Pt
-
 # --- Rendering ---------------------------------------------------------------
 DPI = 150
 IMAGE_BORDER_PT = 1.0
 
-# --- Word page layout (A4 portrait), lengths in cm ---------------------------
-PAGE_W, PAGE_H = 21.0, 29.7
+# --- Word page layout (A4 landscape, two columns), lengths in cm --------------
+PAGE_W, PAGE_H = 29.7, 21.0  # A4 landscape
 MARGIN = 1.0
-IMAGE_COL = 13.6                                # left (image) column width
-COMMENTS_COL = PAGE_W - 2 * MARGIN - IMAGE_COL  # right column width (5.4)
-CELL_PAD = 0.15                                  # table cell inner margin
-IMAGE_W = IMAGE_COL - 2 * CELL_PAD                # image width inside the cell
+GAP = 0.5                    # gutter between the two columns
+IMAGE_COL = 13.6             # left column: the page image
+IMAGE_W = 13.2               # image width; height 18.66cm fits the 19cm column
+TEXT_COL = PAGE_W - 2 * MARGIN - IMAGE_COL - GAP  # right column: source text
 
-# Schema order for w:tblPr children, used to insert elements in valid sequence.
-_TBLPR_ORDER = (
-    "w:tblStyle", "w:tblpPr", "w:tblW", "w:jc", "w:tblCellSpacing",
-    "w:tblInd", "w:tblBorders", "w:shd", "w:tblLayout", "w:tblCellMar",
-    "w:tblLook", "w:tblCaption", "w:tblDescription",
-)
+# --- Right-column text --------------------------------------------------------
+TEXT_PT = 10                 # body text size on the right
+TEXT_SPACE_AFTER_PT = 3      # paragraph spacing, kept tight for density
+
+# --- Numbered badges (drawn on the source page, in points) -------------------
+BADGE_R_PT = 10.0            # badge circle radius
+BADGE_PAD_PT = 4.0           # gap between badge and the block's left edge
+BADGE_FONT_PT = 10.0         # badge number size (Helvetica-Bold)
+BADGE_MIN_X_PT = 12.0        # never let the badge centre cross the page edge
+# Table-cell badges: smaller, centred on the cell's top-left grid
+# intersection so they cover border lines rather than content.
+TABLE_BADGE_R_PT = 8.0
+TABLE_BADGE_FONT_PT = 8.0
+
+# --- Chrome print cruft to strip from extraction (header/footer bands) -------
+# Chrome's print margins (see webpdf.PRINT_MARGINS) are 0.4in top / 0.56in
+# bottom; header/footer text lives inside those bands. Blocks fully inside a
+# band are dropped. Tolerance added for slightly dipping headers.
+CRUFT_TOP_PT = 30.0
+CRUFT_BOTTOM_PT = 42.0
+EMPTY_CELL_TEXT = "(empty)"  # right-column text for an empty table cell
 
 
 def _log(msg):
     print(msg, file=sys.stderr)
 
 
-def _tblpr_insert(tblPr, element):
-    """Insert element into w:tblPr at its schema-correct position."""
-    order = {qn(tag): i for i, tag in enumerate(_TBLPR_ORDER)}
-    pos = order[element.tag]
-    for child in tblPr:
-        if child.tag in order and order[child.tag] > pos:
-            child.addprevious(element)
-            return
-    tblPr.append(element)
+def _set_current_compat_mode(doc):
+    """Open in Word 2013+ mode, not the template's compatibility mode."""
+    compat = doc.settings.element.find(qn("w:compat"))
+    for cs in compat.findall(qn("w:compatSetting")):
+        if cs.get(qn("w:name")) == "compatibilityMode":
+            cs.set(qn("w:val"), "15")
 
 
-def _set_fixed_layout(table):
-    """Force fixed table layout so column widths are honoured exactly."""
-    tblPr = table._tbl.tblPr
-    layout = OxmlElement("w:tblLayout")
-    layout.set(qn("w:type"), "fixed")
-    _tblpr_insert(tblPr, layout)
-    table.autofit = False
+def _set_print_layout(doc):
+    """Open the document in Print Layout view, not Web/Reading Layout."""
+    settings = doc.settings.element
+    view = OxmlElement("w:view")
+    view.set(qn("w:val"), "print")
+    zoom = settings.find(qn("w:zoom"))
+    if zoom is not None:
+        zoom.addprevious(view)
+    else:
+        settings.insert(0, view)
 
 
-def _set_cell_margins(table, pad_cm):
-    """Set uniform inner cell margins (w:dxa = twentieths of a point)."""
-    dxa = str(int(round(pad_cm * 567)))
-    mar = OxmlElement("w:tblCellMar")
-    for side in ("top", "left", "bottom", "right"):
-        el = OxmlElement(f"w:{side}")
-        el.set(qn("w:w"), "0" if side in ("top", "bottom") else dxa)
-        el.set(qn("w:type"), "dxa")
-        mar.append(el)
-    _tblpr_insert(table._tbl.tblPr, mar)
+def _setup_section(section):
+    """Landscape A4 with two unequal columns: image left, text right.
+
+    python-docx has no API for unequal section columns, so w:cols is built
+    by hand and swapped in for the template's, in its schema-correct
+    position (w:cols comes before w:docGrid in w:sectPr).
+    """
+    section.orientation = WD_ORIENT.LANDSCAPE
+    section.page_width, section.page_height = Cm(PAGE_W), Cm(PAGE_H)
+    section.top_margin = section.bottom_margin = Cm(MARGIN)
+    section.left_margin = section.right_margin = Cm(MARGIN)
+
+    sectPr = section._sectPr
+    cols = OxmlElement("w:cols")
+    cols.set(qn("w:num"), "2")
+    cols.set(qn("w:space"), str(int(GAP * 567)))
+    c1 = OxmlElement("w:col")
+    c1.set(qn("w:w"), str(int(IMAGE_COL * 567)))
+    c1.set(qn("w:space"), str(int(GAP * 567)))
+    c2 = OxmlElement("w:col")
+    c2.set(qn("w:w"), str(int(TEXT_COL * 567)))
+    cols.append(c1)
+    cols.append(c2)
+
+    old = sectPr.find(qn("w:cols"))
+    if old is not None:
+        old.addprevious(cols)
+        sectPr.remove(old)
+    else:
+        anchor = sectPr.find(qn("w:docGrid"))
+        if anchor is not None:
+            anchor.addprevious(cols)
+        else:
+            sectPr.append(cols)
 
 
-def _keep_row_together(row):
-    """Prevent the row from splitting across Word pages."""
-    trPr = row._tr.get_or_add_trPr()
-    trPr.append(OxmlElement("w:cantSplit"))
+def _overlap_fraction(rect, region):
+    """Fraction of rect's area that lies inside region."""
+    inter = fitz.Rect(rect) & fitz.Rect(region)
+    if not inter.is_valid or inter.is_empty:
+        return 0.0
+    return inter.get_area() / max(fitz.Rect(rect).get_area(), 1e-9)
+
+
+def _page_items(page):
+    """Extract the page's text as (text, rect, kind) triples, reading order.
+
+    kind is "block" for ordinary paragraphs and "cell" for table cells:
+    every cell of every detected table is numbered individually, empty ones
+    included. Text blocks inside a detected table are folded into their cell
+    rather than numbered twice. Chrome header/footer bands are stripped.
+    """
+    page_h = page.rect.height
+    try:
+        tables = list(page.find_tables().tables)
+    except Exception:
+        tables = []
+    regions = [fitz.Rect(t.bbox) for t in tables]
+
+    items = []
+    for block in page.get_text("dict", sort=True)["blocks"]:
+        if block.get("type") != 0:
+            continue
+        rect = fitz.Rect(block["bbox"])
+        if rect.y1 <= CRUFT_TOP_PT or rect.y0 >= page_h - CRUFT_BOTTOM_PT:
+            continue  # header/footer band
+        if any(_overlap_fraction(rect, r) > 0.5 for r in regions):
+            continue  # numbered as part of its cell instead
+        lines = []
+        for line in block["lines"]:
+            text = "".join(span["text"] for span in line["spans"]).strip()
+            if text:
+                lines.append(text)
+        if not lines:
+            continue
+        # Reflow: join lines, mending words hyphenated across a line break.
+        out = lines[0]
+        for text in lines[1:]:
+            if out.endswith("-"):
+                out = out[:-1] + text
+            else:
+                out += " " + text
+        out = out.strip()
+        if out:
+            items.append((out, rect, "block"))
+
+    # Every cell of every detected table, row-major; dedupe merged cells.
+    seen = set()
+    for t in tables:
+        for row in t.rows:
+            for cell in row.cells:
+                if cell is None:
+                    continue
+                rect = fitz.Rect(cell)
+                if rect.y1 <= CRUFT_TOP_PT or rect.y0 >= page_h - CRUFT_BOTTOM_PT:
+                    continue
+                key = (round(rect.x0, 1), round(rect.y0, 1),
+                       round(rect.x1, 1), round(rect.y1, 1))
+                if key in seen:
+                    continue
+                seen.add(key)
+                text = " ".join(page.get_text("text", clip=rect).split())
+                items.append((text or EMPTY_CELL_TEXT, rect, "cell"))
+
+    items.sort(key=lambda it: (it[1].y0, it[1].x0))
+    return items
+
+
+def _draw_badge(page, n, rect, kind):
+    """Bake badge number n into the page.
+
+    Block: just left of the block's first character at the block's own y,
+    with a semi-transparent overlay on the block's top-left corner when
+    there is no room to the left.
+
+    Cell: smaller, centred on the cell's top-left grid intersection — it
+    covers border lines (decoration) rather than content, and consecutive
+    rows' badges don't collide for rows taller than the badge diameter.
+    """
+    if kind == "cell":
+        r, font_pt = TABLE_BADGE_R_PT, TABLE_BADGE_FONT_PT
+        cx, cy = rect.x0, rect.y0
+        overlay = False
+    else:
+        r, font_pt = BADGE_R_PT, BADGE_FONT_PT
+        cx = rect.x0 - r - BADGE_PAD_PT
+        overlay = cx < BADGE_MIN_X_PT
+        if overlay:
+            cx = rect.x0 + r
+        cy = rect.y0 + r
+
+    shape = page.new_shape()
+    shape.draw_oval(fitz.Rect(cx - r, cy - r, cx + r, cy + r))
+    if overlay:
+        shape.finish(color=(0, 0, 0), fill=(1, 1, 1), fill_opacity=0.85, width=1.0)
+    else:
+        shape.finish(color=(0, 0, 0), fill=(1, 1, 1), width=1.0)
+    shape.commit()
+
+    label = str(n)
+    w = fitz.get_text_length(label, fontname="hebo", fontsize=font_pt)
+    page.insert_text((cx - w / 2.0, cy + 0.36 * font_pt), label,
+                     fontsize=font_pt, fontname="hebo", color=(0, 0, 0))
 
 
 def _render_page_png(page, matrix):
@@ -94,56 +245,46 @@ def _render_page_png(page, matrix):
     return pix.tobytes("png")
 
 
-def _set_current_compat_mode(doc):
-    """Open in Word 2013+ mode, not the template's compatibility mode."""
-    compat = doc.settings.element.find(qn("w:compat"))
-    for cs in compat.findall(qn("w:compatSetting")):
-        if cs.get(qn("w:name")) == "compatibilityMode":
-            cs.set(qn("w:val"), "15")
+def _add_tiny_break_paragraph(doc, break_type):
+    """Near-zero-height paragraph whose only job is to carry a break.
+
+    2pt font so the paragraph still fits under the 18.66cm image in
+    column 1 (column break) or adds nothing before the next page (page
+    break). Word's performance depends on there being a single section, so
+    pages are separated by page breaks, not section breaks: a page break in
+    a multi-column section lands at the top of column 1 on the next page.
+    """
+    p = doc.add_paragraph()
+    p.paragraph_format.space_before = p.paragraph_format.space_after = Pt(0)
+    run = p.add_run()
+    run.font.size = Pt(2)
+    run.add_break(break_type)
 
 
-def _heading_with_rule(paragraph, text):
-    """Bold heading with a thin rule underneath (e.g. the Comments header)."""
-    run = paragraph.add_run(text)
-    run.bold = True
-    run.font.size = Pt(10)
-    pPr = paragraph._p.get_or_add_pPr()  # fresh paragraph: pPr is empty
-    pBdr = OxmlElement("w:pBdr")
-    bottom = OxmlElement("w:bottom")
-    bottom.set(qn("w:val"), "single")
-    bottom.set(qn("w:sz"), "4")  # half-point units: 0.5pt
-    bottom.set(qn("w:space"), "2")
-    bottom.set(qn("w:color"), "000000")
-    pBdr.append(bottom)
-    pPr.append(pBdr)
+def _add_page(doc, page_index, png_bytes, items, is_last_page):
+    """One landscape Word page: image in column 1, numbered text in column 2."""
+    # Column 1: the page image with badges and border baked in.
+    img_p = doc.add_paragraph()
+    img_p.paragraph_format.space_before = img_p.paragraph_format.space_after = Pt(0)
+    img_p.add_run().add_picture(BytesIO(png_bytes), width=Cm(IMAGE_W))
 
+    # Tiny column break so the text starts at the top of column 2.
+    _add_tiny_break_paragraph(doc, WD_BREAK.COLUMN)
 
-def _add_page_table(doc, png_bytes):
-    """One two-column page: image left, Comments column right."""
-    table = doc.add_table(rows=1, cols=2)
-    _set_fixed_layout(table)
-    _set_cell_margins(table, CELL_PAD)
-    _keep_row_together(table.rows[0])
+    # Column 2: the page's text, reflowed, numbered to match the badges.
+    for n, (text, _rect, _kind) in enumerate(items, 1):
+        para = doc.add_paragraph()
+        para.paragraph_format.space_before = Pt(0)
+        para.paragraph_format.space_after = Pt(TEXT_SPACE_AFTER_PT)
+        num = para.add_run(f"{n} ")
+        num.bold = True
+        num.font.size = Pt(TEXT_PT)
+        body = para.add_run(text)
+        body.font.size = Pt(TEXT_PT)
 
-    table.columns[0].width = Cm(IMAGE_COL)
-    table.columns[1].width = Cm(COMMENTS_COL)
-
-    img_cell, com_cell = table.rows[0].cells
-    for cell, width in ((img_cell, IMAGE_COL), (com_cell, COMMENTS_COL)):
-        cell.width = Cm(width)
-        cell.vertical_alignment = WD_ALIGN_VERTICAL.TOP
-
-    # Left: the page image, centred, with its 1pt black border baked in.
-    para = img_cell.paragraphs[0]
-    para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    para.add_run().add_picture(BytesIO(png_bytes), width=Cm(IMAGE_W))
-
-    # Right: Comments heading + blank space for the reviewer.
-    _heading_with_rule(com_cell.paragraphs[0], "Comments")
-    com_cell.add_paragraph()
-    com_cell.add_paragraph()
-
-    return table
+    # Next source page starts at the top of column 1 on the next Word page.
+    if not is_last_page:
+        _add_tiny_break_paragraph(doc, WD_BREAK.PAGE)
 
 
 def convert(pdf_path, docx_path, dpi=DPI):
@@ -157,28 +298,21 @@ def convert(pdf_path, docx_path, dpi=DPI):
 
         doc = Document()
         _set_current_compat_mode(doc)
-        section = doc.sections[0]
-        section.page_width, section.page_height = Cm(PAGE_W), Cm(PAGE_H)
-        section.top_margin = section.bottom_margin = Cm(MARGIN)
-        section.left_margin = section.right_margin = Cm(MARGIN)
+        _set_print_layout(doc)
+        _setup_section(doc.sections[0])
 
         zoom = dpi / 72.0
         matrix = fitz.Matrix(zoom, zoom)
-        for i, page in enumerate(pdf, start=1):
-            _add_page_table(doc, _render_page_png(page, matrix))
-            if i < n_pages:
-                br = doc.add_paragraph()
-                br.paragraph_format.space_before = Pt(0)
-                br.paragraph_format.space_after = Pt(0)
-                run = br.add_run()
-                run.font.size = Pt(2)
-                run.add_break(WD_BREAK.PAGE)
-            if i % 10 == 0 or i == n_pages:
-                _log(f"  docx: {i}/{n_pages} pages built")
+        for i, page in enumerate(pdf):
+            items = _page_items(page)             # extract text first...
+            for n, (_t, rect, kind) in enumerate(items, 1):
+                _draw_badge(page, n, rect, kind)  # ...then bake badges in
+            png = _render_page_png(page, matrix)
+            _add_page(doc, i, png, items, is_last_page=(i == n_pages - 1))
+            if (i + 1) % 10 == 0 or (i + 1) == n_pages:
+                _log(f"  docx: {i + 1}/{n_pages} pages built")
         _log("")
 
-    # Word expects a paragraph after a table that ends the document.
-    doc.add_paragraph()
     doc.save(docx_path)
     size_mb = docx_path.stat().st_size / 1_000_000
     _log(f"  wrote {docx_path} ({size_mb:.1f} MB)")
